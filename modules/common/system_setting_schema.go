@@ -201,6 +201,24 @@ var systemSettingSchema = []settingDef{
 	{Category: "sticker", Key: "compress_max_dimension", Type: settingTypeInt, Description: "贴纸压缩缩放目标边长(px，仅静态 jpg/png)；压缩开启后大于此值等比缩小再存；硬上限 1024，默认 512。建议 ≤ upload_max_dimension，否则压后仍超 upload_max_dimension 的图会被 fail-closed 拒绝", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxDimension()) }},
 
+	// Space 新成员欢迎语（onboarding.space_welcome_*）— task
+	// space-new-user-welcome-message。这四个键必须构成一致的「启用组合」：
+	// enabled=true 时，space_id 必须指向存在且未解散的 Space，active_from 可按
+	// RFC3339(UTC) 解析，message trim 后非空且 ≤2000 code points。写侧做
+	// prospective 组合校验（merge 快照+入参），worker/reconciler 每周期再校验一次
+	// fail-closed。调用方读取一律走 SpaceWelcomeConfig()（单快照原子读四键），
+	// 不要逐键读，避免跨 Reload() 拼出不一致组合。默认关闭，随快照 60s 内多实例收敛。
+	// 文案是「所有人同一份纯文本」，不区分语言；支持换行（\n 原样保留、客户端 type:1
+	// 文本渲染换行），不渲染 markdown。
+	{Category: "onboarding", Key: "space_welcome_enabled", Type: settingTypeBool, Description: "是否开启「新成员加入指定 Space 时由通知助手发送一条欢迎语 DM」（默认关闭；启用需 space_id/active_from/message 构成有效组合）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.SpaceWelcomeConfig().Enabled) }},
+	{Category: "onboarding", Key: "space_welcome_space_id", Type: settingTypeString, Description: "欢迎语目标 Space 的 space_id（必须存在且未解散）",
+		Effective: func(s *SystemSettings) string { return s.SpaceWelcomeConfig().SpaceID }},
+	{Category: "onboarding", Key: "space_welcome_active_from", Type: settingTypeString, Description: "欢迎语生效起点（RFC3339 UTC，如 2026-07-16T00:00:00Z）；仅 created_at>=此刻首次加入的成员会收到",
+		Effective: func(s *SystemSettings) string { return s.SpaceWelcomeConfig().ActiveFromRaw }},
+	{Category: "onboarding", Key: "space_welcome_message", Type: settingTypeString, Description: "欢迎语文案（纯文本，所有人同一份，trim 后非空，≤2000 字符；支持换行 \\n，不渲染 markdown）",
+		Effective: func(s *SystemSettings) string { return s.SpaceWelcomeConfig().Message }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},

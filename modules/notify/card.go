@@ -299,6 +299,30 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		return nil, errNotifyCardInvalid
 	}
 
+	// C1 policy (docs/platform-card-base.md §10):
+	// Schema-level field errors are caller contract violations — they must reject
+	// the whole request with 400 zero delivery, and be observable at ingress.
+	// Running schema check here (before memberCache, before docsSender gate,
+	// before cardmsg.Enabled) guarantees the check cannot be silently skipped by:
+	//   (a) an empty-member request (200 with delivered=[]),
+	//   (b) docsSender==nil / cardmsg.Enabled()==false (text degradation).
+	// Only the access_requested + gate-on branch flows through Registry.Render;
+	// other kinds keep the historical validate-in-builder behavior.
+	if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
+		if err := preflightDocsAccessRequestSchema(card); err != nil {
+			// R2-2: preflight 现在能返 typed errCardTmplUnavailable (Registry/Template
+			// 未注入,composition bug) —— 与 schema 400 分开处理,让 500 不降级。
+			if errors.Is(err, errCardTmplUnavailable) {
+				n.Error("docs access-request card preflight: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				return nil, err // api.go 兜底走 500
+			}
+			n.Warn("docs access-request card rejected at preflight: schema (400)",
+				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+			return nil, errNotifyCardInvalid
+		}
+	}
+
 	targets := dedupTargets(req.Targets)
 	if req.ActorUID != "" {
 		tmp := make([]string, 0, len(targets))
@@ -325,6 +349,10 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 
 	lang := i18n.OutboundLanguage(context.Background())
 
+	// Fill the actor display name server-side when the producer sent only the
+	// uid (empty ActorName + non-empty ActorUID). Best-effort; see hydrateActorName.
+	n.hydrateActorName(card)
+
 	canCard := n.docsSender != nil && cardmsg.Enabled()
 	profile := cardmsg.ProfileV1
 	var document json.RawMessage
@@ -335,11 +363,32 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		)
 		if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
 			profile = cardmsg.ProfileV2
-			doc, buildErr = n.buildDocsAccessRequestCard(context.Background(), req.SpaceID, card, lang)
+			// F7: 唯一入口。Registry 未注入 = composition bug,不再 fallback 到 legacy
+			// (那样会遮蔽 wiring 漏洞);buildErr non-nil 分类走 render_error 降级文本。
+			doc, buildErr = n.buildDocsAccessRequestCardViaRegistry(context.Background(), req.SpaceID, card, lang)
 		} else {
 			doc, buildErr = n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
 		}
 		if buildErr != nil {
+			// C1 policy (docs/platform-card-base.md §10):
+			// - schema-level field errors (typed cardtmpl.ErrFieldsInvalid) → 400,
+			//   zero delivery. Reject the whole request instead of silently
+			//   masking a caller contract violation as a plain-text DM.
+			// - Registry/Template unavailable (typed errCardTmplUnavailable,
+			//   composition bug) → propagate as internal error (500 from api.go
+			//   layer),不降级 —— 静默走 text 会遮蔽 wiring 漏洞 (R2-2 / A14)。
+			// - other build errors (render failure / marshal / dependency) →
+			//   degrade to plain-text so the notification still lands.
+			if errors.Is(buildErr, cardtmpl.ErrFieldsInvalid) {
+				n.Warn("docs access-request card rejected: fields did not pass schema (400)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				return nil, errNotifyCardInvalid
+			}
+			if errors.Is(buildErr, errCardTmplUnavailable) {
+				n.Error("docs access-request card: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				return nil, buildErr // 不 wrap 为 errNotifyCardInvalid,api.go 兜底走 500
+			}
 			n.Warn("build docs card failed, degrading to text",
 				zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
 			canCard = false
@@ -413,6 +462,25 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 	return &NotifyResp{Delivered: delivered, Filtered: filteredMap}, nil
 }
 
+// hydrateActorName fills card.ActorName from card.ActorUID via the user service
+// when the producer sent only the uid (empty name). octo-server is the identity
+// authority, so this removes the producer's need for a user-lookup credential
+// (e.g. docs-backend's short-lived session token). Best-effort and idempotent:
+// a pre-resolved name is left untouched, and any lookup miss/error leaves the
+// name empty so the card degrades to the anonymous banner exactly as before.
+func (n *Notify) hydrateActorName(card *DocsCardFields) {
+	if card == nil || strings.TrimSpace(card.ActorName) != "" {
+		return
+	}
+	actorUID := strings.TrimSpace(card.ActorUID)
+	if actorUID == "" || n.userService == nil {
+		return
+	}
+	if resp, err := n.userService.GetUser(actorUID); err == nil && resp != nil {
+		card.ActorName = resp.Name
+	}
+}
+
 // buildDocsCard renders the octo/v1 ResourceCard for a docs-notify
 // notification. Kind maps to Variant / Attribution deterministically; ActorName
 // and UpdatedAt render as optional FactSet rows. Excerpt is the free-form
@@ -441,29 +509,39 @@ func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCa
 	})
 }
 
+// buildDocsAccessRequestCard 是**迁移前的 legacy 构造路径,已不在生产链路上**:
+// deliverDocsCardNotification 的 access_requested + gate 分支走
+// buildDocsAccessRequestCardViaRegistry(Registry.Render 唯一入口)。本方法仅存留作
+// 迁移基线 —— card_via_registry_baseline_test.go 用它产出 pre-migration 输出,
+// 断言与 Registry.Render 字节等价;card_action_test.go 也引用它。请勿把它误当成
+// 第二条活的生产渲染路径;真要改 access-request 卡的生产行为,改 pilot Template
+// (pkg/cardtmpl/docs_access_request) 或 Registry.Render。
 func (n *Notify) buildDocsAccessRequestCard(ctx context.Context, spaceID string, card *DocsCardFields, lang string) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
-	facts := make([]cardtmpl.Fact, 0, 2)
-	if actor := strings.TrimSpace(card.ActorName); actor != "" {
-		facts = append(facts, cardtmpl.Fact{Title: labels.actor, Value: actor})
+	actor := strings.TrimSpace(card.ActorName)
+	bannerSuffix := labels.requestBannerSuffix
+	if actor == "" {
+		bannerSuffix = labels.requestBannerAnon
 	}
-	if ts := strings.TrimSpace(card.UpdatedAt); ts != "" {
-		facts = append(facts, cardtmpl.Fact{Title: labels.updatedAt, Value: ts})
-	}
-	attribution, variant := docsAttributionAndVariant(card.Kind, card.ActorName, labels)
 	return cardtmpl.BuildDocsAccessRequestCard(
 		ctx,
 		n.ctx.GetConfig().External.WebLoginURL,
 		card.DocID,
 		card.RequestID,
 		spaceID,
-		cardtmpl.ResourceCard{
-			Title:       card.Title,
-			Attribution: attribution,
-			Excerpt:     strings.TrimSpace(card.Excerpt),
-			Facts:       facts,
-			Variant:     variant,
-			Source:      cardtmpl.Source{Label: labels.sourceLabel},
+		cardtmpl.DocsApprovalContent{
+			Title:        card.Title,
+			Actor:        actor,
+			ActorAvatar:  strings.TrimSpace(card.ActorAvatarURL),
+			Timestamp:    strings.TrimSpace(card.UpdatedAt),
+			Reason:       strings.TrimSpace(card.Excerpt),
+			Variant:      "docs.access_requested",
+			Source:       cardtmpl.Source{Label: labels.sourceLabel},
+			HeaderLabel:  labels.approvalHeader,
+			StatusLabel:  labels.pendingStatus,
+			BannerSuffix: bannerSuffix,
+			RoleLabel:    labels.roleRequester,
+			ReasonLabel:  labels.reasonLabel,
 		},
 		cardtmpl.ApprovalActions{ApproveTitle: labels.approve, DenyTitle: labels.deny},
 	)
@@ -517,7 +595,18 @@ func docsAttributionAndVariant(kind, actorName string, labels docsLabels) (strin
 // DM used when a card cannot be built (feature disabled, sender missing, or
 // template/config error). No information is lost — every field that would
 // appear on the card is emitted as a text line.
+//
+// F6: for the access_requested + gate-on + Registry-wired branch, delegate to
+// pilot Template.FallbackText — that is the L0 authoritative fallback for the
+// pilot Template. Other kinds keep the historical multi-line composition.
+// If Template.FallbackText is unavailable (Registry unwired / mapping fails),
+// fall back to the historical composition so callers never lose the text path.
 func buildDocsFallbackText(card *DocsCardFields, lang string) string {
+	if card != nil && card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
+		if text, ok := templateFallbackText(card, lang); ok {
+			return text
+		}
+	}
 	labels := docsLabelsFor(lang)
 	// sanitizeLine the actor before it flows into the attribution line, and each
 	// other caller field, so an embedded newline can't inject a spoofed line.
@@ -558,6 +647,18 @@ type docsLabels struct {
 	updatedAt                 string
 	kvSep                     string
 	sourceLabel               string // ResourceCard.Source.Label — "文档" / "Docs"
+	// Enriched access-request / outcome card copy (docs-approval-card-enrich).
+	approvalHeader      string // header label — "文档申请" / "Document access"
+	pendingStatus       string // "待你处理" / "Pending"
+	approvedStatus      string // "已允许" / "Approved"
+	deniedStatus        string // "已拒绝" / "Denied"
+	requestBannerSuffix string // subtle sentence after the bold actor
+	requestBannerAnon   string // subject-less banner when actor is unknown
+	roleRequester       string // "申请人" / "Requester"
+	reasonLabel         string // "申请原因" / "Reason"
+	denyReasonLabel     string // "拒绝原因" / "Reason for denial"
+	approvedResult      string // result-box copy on approval
+	deniedResult        string // result-box copy on denial
 }
 
 func docsLabelsFor(lang string) docsLabels {
@@ -580,6 +681,17 @@ func docsLabelsFor(lang string) docsLabels {
 			updatedAt:                 "时间",
 			kvSep:                     "：",
 			sourceLabel:               "文档",
+			approvalHeader:            "文档申请",
+			pendingStatus:             "待你处理",
+			approvedStatus:            "已允许",
+			deniedStatus:              "已拒绝",
+			requestBannerSuffix:       "申请成为此文档的查看者。",
+			requestBannerAnon:         "有人申请成为此文档的查看者。",
+			roleRequester:             "申请人",
+			reasonLabel:               "申请原因",
+			denyReasonLabel:           "拒绝原因",
+			approvedResult:            "申请人已获得所申请的文档权限。",
+			deniedResult:              "申请已被拒绝。",
 		}
 	}
 	return docsLabels{
@@ -600,6 +712,17 @@ func docsLabelsFor(lang string) docsLabels {
 		updatedAt:                 "At",
 		kvSep:                     ": ",
 		sourceLabel:               "Docs",
+		approvalHeader:            "Document access",
+		pendingStatus:             "Pending",
+		approvedStatus:            "Approved",
+		deniedStatus:              "Denied",
+		requestBannerSuffix:       "is requesting viewer access to this document.",
+		requestBannerAnon:         "Someone is requesting viewer access to this document.",
+		roleRequester:             "Requester",
+		reasonLabel:               "Reason",
+		denyReasonLabel:           "Reason for denial",
+		approvedResult:            "The requester now has the requested document access.",
+		deniedResult:              "The access request was denied.",
 	}
 }
 

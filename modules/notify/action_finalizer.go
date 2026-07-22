@@ -74,7 +74,13 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	if title == "" {
 		title = docID
 	}
-	terminalDocument, err := f.buildTerminalDocument(ctx, lang, docID, event.SpaceID, title, result)
+	// The reviewer deny reason (if any) rode in as a declared input; surface it on
+	// the denied terminal card. Missing/blank is fine (approve, or no reason typed).
+	denyReason := ""
+	if v, ok := event.Inputs[cardtmpl.DocsDenyReasonInputID].(string); ok {
+		denyReason = strings.TrimSpace(v)
+	}
+	terminalDocument, err := f.buildTerminalDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result)
 	if err != nil {
 		return err
 	}
@@ -91,7 +97,7 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	if result.State != cardactiondispatch.StateApproved && result.State != cardactiondispatch.StateDenied {
 		return nil
 	}
-	outcomeDocument, err := f.buildOutcomeDocument(ctx, lang, docID, event.SpaceID, title, result.State)
+	outcomeDocument, err := f.buildOutcomeDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result.State)
 	if err != nil {
 		return err
 	}
@@ -104,34 +110,60 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	return nil
 }
 
-func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, docID, spaceID, title string, result cardactiondispatch.DecisionResult) (json.RawMessage, error) {
+func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, result cardactiondispatch.DecisionResult) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
-	attribution := labels.accessDeniedBanner
-	variant := "docs.access_denied"
+	webLoginURL := f.ctx.GetConfig().External.WebLoginURL
+	// Approved / denied get the enriched outcome card (header + title + result
+	// box); the denied box surfaces the reviewer reason.
 	switch result.State {
 	case cardactiondispatch.StateApproved:
-		attribution, variant = labels.accessGrantedBanner, "docs.access_approved"
+		return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
+			Title: title, Variant: "docs.access_approved", Source: cardtmpl.Source{Label: labels.sourceLabel},
+			Denied: false, HeaderLabel: labels.approvalHeader, StatusLabel: labels.approvedStatus,
+			ResultText: labels.approvedResult,
+		})
 	case cardactiondispatch.StateDenied:
-		attribution, variant = labels.accessDeniedBanner, "docs.access_denied"
-	case cardactiondispatch.StateCancelled:
-		attribution, variant = labels.accessCancelledBanner, "docs.access_cancelled"
-	default:
-		attribution, variant = labels.accessUnavailableBanner, "docs.access_unavailable"
+		return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
+			Title: title, Variant: "docs.access_denied", Source: cardtmpl.Source{Label: labels.sourceLabel},
+			Denied: true, HeaderLabel: labels.approvalHeader, StatusLabel: labels.deniedStatus,
+			ResultText: labels.deniedResult, ReasonLabel: labels.denyReasonLabel, Reason: denyReason,
+		})
 	}
-	return cardtmpl.BuildDocsResourceCard(ctx, f.ctx.GetConfig().External.WebLoginURL, docID, spaceID, cardtmpl.ResourceCard{
+	// Cancelled / unavailable are transient states without an enriched design —
+	// keep the prior plain resource-card rebuild.
+	attribution, variant := labels.accessUnavailableBanner, "docs.access_unavailable"
+	if result.State == cardactiondispatch.StateCancelled {
+		attribution, variant = labels.accessCancelledBanner, "docs.access_cancelled"
+	}
+	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, docID, spaceID, cardtmpl.ResourceCard{
 		Title: title, Attribution: attribution, Variant: variant, Source: cardtmpl.Source{Label: labels.sourceLabel},
 	})
 }
 
-func (f *DocsActionFinalizer) buildOutcomeDocument(ctx context.Context, lang, docID, spaceID, title string, state cardactiondispatch.State) (json.RawMessage, error) {
+func (f *DocsActionFinalizer) buildOutcomeDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, state cardactiondispatch.State) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	attribution := labels.accessGrantedBanner
 	variant := "docs.access_granted"
+	var facts []cardtmpl.Fact
 	if state == cardactiondispatch.StateDenied {
 		attribution, variant = labels.accessDeniedBanner, "docs.access_denied"
+		// Surface the reviewer's reason to the applicant — a denial is useless to
+		// them without it. Rides as a labeled FactSet row on the same resource
+		// card (no profile/card-type change); omitted when no reason was typed.
+		if reason := strings.TrimSpace(denyReason); reason != "" {
+			// cardtmpl caps FactSet values at maxFactRunes; an over-long reason
+			// fails the whole card build and drops the denial notification
+			// entirely (retries included). Truncate to MaxExcerptRunes — the
+			// same bound the terminal card's reason box uses — so a long reason
+			// is trimmed, never silently lost.
+			if r := []rune(reason); len(r) > cardtmpl.MaxExcerptRunes {
+				reason = string(r[:cardtmpl.MaxExcerptRunes])
+			}
+			facts = append(facts, cardtmpl.Fact{Title: labels.denyReasonLabel, Value: reason})
+		}
 	}
 	return cardtmpl.BuildDocsResourceCard(ctx, f.ctx.GetConfig().External.WebLoginURL, docID, spaceID, cardtmpl.ResourceCard{
-		Title: title, Attribution: attribution, Variant: variant, Source: cardtmpl.Source{Label: labels.sourceLabel},
+		Title: title, Attribution: attribution, Variant: variant, Facts: facts, Source: cardtmpl.Source{Label: labels.sourceLabel},
 	})
 }
 
